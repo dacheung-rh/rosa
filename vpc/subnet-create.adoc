@@ -1,0 +1,204 @@
+##########################################################################
+# Change correct region (i.e. Singapure) then login AWS console and start cloudShell
+# use aws cli create vpc subnet and bastion VM
+
+## 1. verify cli verion and region
+aws --version
+
+aws sts get-caller-identity
+
+echo $AWS_REGION
+
+export ROSA_CLUSTER_NAME=rosa-${GUID}
+
+## 2. Create a VPC to install a ROSA cluster into
+VPC_ID=`aws ec2 create-vpc --cidr-block 10.0.0.0/16 --output json | jq -r .Vpc.VpcId`
+
+aws ec2 create-tags --resources $VPC_ID \
+  --tags Key=Name,Value=$ROSA_CLUSTER_NAME --output json | jq .
+
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames --output json | jq .
+
+## 3. Create a Public Subnet for the cluster to NAT egress traffic out of
+PUBLIC_SUBNET=`aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.128.0/17 --output json | jq -r .Subnet.SubnetId`
+
+aws ec2 create-tags --resources $PUBLIC_SUBNET \
+  --tags Key=Name,Value=$ROSA_CLUSTER_NAME-public --output json | jq .
+
+## 4. Create a Private Subnet for the cluster machines to live in
+PRIVATE_SUBNET=`aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.0.0/17 --output json | jq -r .Subnet.SubnetId`
+
+aws ec2 create-tags --resources $PRIVATE_SUBNET \
+  --tags Key=Name,Value=$ROSA_CLUSTER_NAME-private --output json | jq .
+
+## 5. Create an Internet Gateway for NAT egress traffic
+I_GW=`aws ec2 create-internet-gateway --output json | jq -r .InternetGateway.InternetGatewayId`
+
+aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $I_GW --output json | jq .
+
+aws ec2 create-tags --resources $I_GW \
+  --tags Key=Name,Value=$ROSA_CLUSTER_NAME --output json | jq .
+
+## 6. Create a Route Table for NAT egress traffic
+R_TABLE=`aws ec2 create-route-table --vpc-id $VPC_ID --output json | jq -r .RouteTable.RouteTableId`
+
+## if internet gateway not created
+#aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $I_GW --region $AWS_REGION
+
+aws ec2 create-route --route-table-id $R_TABLE --destination-cidr-block 0.0.0.0/0 --gateway-id $I_GW --output json | jq .
+
+aws ec2 describe-route-tables --route-table-id $R_TABLE --output json | jq .
+
+aws ec2 associate-route-table --subnet-id $PUBLIC_SUBNET --route-table-id $R_TABLE --output json | jq .
+
+aws ec2 create-tags --resources $R_TABLE \
+  --tags Key=Name,Value=$ROSA_CLUSTER_NAME --output json | jq .
+
+## 7. Create a NAT Gateway for the Private network
+EIP=`aws ec2 allocate-address --domain vpc --output json | jq -r .AllocationId`
+NAT_GW=`aws ec2 create-nat-gateway --subnet-id $PUBLIC_SUBNET \
+  --allocation-id $EIP --output json | jq -r .NatGateway.NatGatewayId`
+
+aws ec2 create-tags --resources $EIP --resources $NAT_GW \
+  --tags Key=Name,Value=$ROSA_CLUSTER_NAME --output json | jq .
+
+## 8. Create a Route Table for the Private subnet to the NAT
+R_TABLE_NAT=`aws ec2 create-route-table --vpc-id $VPC_ID --output json | jq -r .RouteTable.RouteTableId`
+
+while ! aws ec2 describe-route-tables --route-table-id $R_TABLE_NAT --output json \
+  | jq .; do sleep 1; done
+
+aws ec2 create-route --route-table-id $R_TABLE_NAT --destination-cidr-block 0.0.0.0/0 --gateway-id $NAT_GW --output json | jq .
+
+aws ec2 associate-route-table --subnet-id $PRIVATE_SUBNET --route-table-id $R_TABLE_NAT --output json | jq .
+
+aws ec2 create-tags --resources $R_TABLE_NAT $EIP \
+  --tags Key=Name,Value=$ROSA_CLUSTER_NAME-private --output json | jq .
+
+#######################################################
+#######################################################
+# create VPC endpoints
+echo $AWS_REGION
+echo $VPC_ID
+echo $PRIVATE_SUBNET
+
+SEC_GRP_ID=`aws ec2 create-security-group --group-name hkex-vpce-sec-grp --description "hkex-vpce-sec-grp" --vpc-id $VPC_ID --output json | jq -r .GroupId`
+echo $SEC_GRP_ID
+
+aws ec2 authorize-security-group-ingress --group-id $SEC_GRP_ID --protocol tcp --port 443 --cidr 10.0.0.0/0
+
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames "{\"Value\":true}"
+
+aws ec2 create-vpc-endpoint \
+    --vpc-id $VPC_ID \
+    --service-name com.amazonaws.$AWS_REGION.s3 \
+    --route-table-ids $R_TABLE
+    
+aws ec2 create-vpc-endpoint \
+    --vpc-id $VPC_ID \
+    --vpc-endpoint-type Interface \
+    --service-name com.amazonaws.$AWS_REGION.sts \
+    --subnet-ids $PRIVATE_SUBNET \
+    --security-group-id $SEC_GRP_ID
+    
+aws ec2 create-vpc-endpoint \
+    --vpc-id $VPC_ID \
+    --vpc-endpoint-type Interface \
+    --service-name com.amazonaws.$AWS_REGION.ec2 \
+    --subnet-ids $PRIVATE_SUBNET \
+    --security-group-id $SEC_GRP_ID
+
+aws ec2 create-vpc-endpoint \
+    --vpc-id $VPC_ID \
+    --vpc-endpoint-type Interface \
+    --service-name com.amazonaws.$AWS_REGION.elasticloadbalancing \
+    --subnet-ids $PRIVATE_SUBNET \
+    --security-group-id $SEC_GRP_ID
+        
+#########################################################
+# bastion host security group and key
+
+AWS_BASTION_SECURITY_GROUP=$(aws ec2 create-security-group \
+  --group-name bastion-security-group \
+  --description "Security group for the bastion host" \
+  --vpc-id $VPC_ID \
+  --query 'GroupId' \
+  --output text)
+ 
+aws ec2 create-tags \
+  --resources $AWS_BASTION_SECURITY_GROUP \
+  --tags Key=Name,Value=bastion-security-group
+
+aws ec2 authorize-security-group-ingress \
+  --group-id $AWS_BASTION_SECURITY_GROUP \
+  --protocol tcp \
+  --port 22 \
+  --cidr 0.0.0.0/0 \
+  --output text
+
+aws ec2 authorize-security-group-ingress \
+  --group-id $AWS_BASTION_SECURITY_GROUP \
+  --protocol tcp \
+  --port 3128 \
+  --cidr 0.0.0.0/0 \
+  --output text
+
+## create or update key pair
+
+AWS_KEY_PAIR=aws-key-pair
+aws ec2 create-key-pair \
+  --key-name $AWS_KEY_PAIR \
+  --query 'KeyMaterial' \
+  --output text > $AWS_KEY_PAIR.pem
+chmod 400 $AWS_KEY_PAIR.pem 
+
+## copy the private key for later access and change pem to 400
+sudo chmod 400 aws-key-pair.pem
+##########################################################################
+# bastion create
+
+echo $PUBLIC_SUBNET
+echo $AWS_KEY_PAIR
+echo $AWS_BASTION_SECURITY_GROUP
+
+#export PUBLIC_SUBNET=subnet-08cf1b8bc28d3074e
+#export AWS_KEY_PAIR=davy
+#export AWS_BASTION_SECURITY_GROUP=sg-0d1e63d287240eef2
+
+AWS_AMI=$(aws ec2 describe-images \
+  --owners 'amazon' \
+  --filters 'Name=name,Values=RHEL-9.3.0_HVM-20240117-x86_64*' \
+  'Name=state,Values=available' \
+  --query 'sort_by(Images, &CreationDate)[-1].[ImageId]' \
+  --output 'text')
+
+AWS_BASTION_HOST=$(aws ec2 run-instances \
+  --image-id $AWS_AMI \
+  --count 1 \
+  --instance-type t3.small \
+  --key-name $AWS_KEY_PAIR \
+  --security-group-ids $AWS_BASTION_SECURITY_GROUP \
+  --subnet-id $PUBLIC_SUBNET \
+  --associate-public-ip-address \
+  --query 'Instances[0].InstanceId' \
+  --output text)
+
+aws ec2 create-tags \
+  --resources $AWS_BASTION_HOST \
+  --tags Key=Name,Value=bastion-host
+
+AWS_BASTION_HOST_PUBLIC_IP=$(aws ec2 describe-instances \
+  --instance-ids $AWS_BASTION_HOST \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' \
+  --output text)
+  
+echo "ssh -i $AWS_KEY_PAIR.pem ec2-user@$AWS_BASTION_HOST_PUBLIC_IP"
+
+[cloudshell-user@ip-10-132-2-248 ~]$ echo "ssh -i $AWS_KEY_PAIR.pem ec2-user@$AWS_BASTION_HOST_PUBLIC_IP"
+ssh -i aws-key-pair.pem ec2-user@54.179.76.182
+
+
+
+
+
+
